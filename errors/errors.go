@@ -651,6 +651,16 @@ var (
 	// Interactive prompt errors.
 	ErrInteractiveModeNotAvailable = errors.New("interactive mode not available")
 	ErrNoOptionsAvailable          = errors.New("no options available")
+
+	// Init and scaffold errors.
+	ErrScaffoldNotFound        = errors.New("scaffold template not found")
+	ErrScaffoldValidation      = errors.New("scaffold validation failed")
+	ErrScaffoldGeneration      = errors.New("scaffold generation failed")
+	ErrInitialization          = errors.New("initialization failed")
+	ErrTemplateProcessing      = errors.New("template processing failed")
+	ErrInvalidScaffoldConfig   = errors.New("invalid scaffold configuration")
+	ErrTargetDirectoryExists   = errors.New("target directory already exists")
+	ErrTargetDirectoryNotEmpty = errors.New("target directory is not empty")
 )
 
 // ExitCodeError is a typed error that preserves subcommand exit codes.

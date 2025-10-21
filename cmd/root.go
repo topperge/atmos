@@ -23,6 +23,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"github.com/cloudposse/atmos/cmd/internal"
 	errUtils "github.com/cloudposse/atmos/errors"
 	e "github.com/cloudposse/atmos/internal/exec"
 	"github.com/cloudposse/atmos/internal/tui/templates"
@@ -49,9 +50,10 @@ import (
 	// The init() function in each package registers the command with the registry.
 	_ "github.com/cloudposse/atmos/cmd/about"
 	"github.com/cloudposse/atmos/cmd/devcontainer"
-	"github.com/cloudposse/atmos/cmd/internal"
+	_ "github.com/cloudposse/atmos/cmd/init"
 	_ "github.com/cloudposse/atmos/cmd/list"
 	_ "github.com/cloudposse/atmos/cmd/profile"
+	_ "github.com/cloudposse/atmos/cmd/scaffold"
 	"github.com/cloudposse/atmos/cmd/terraform/backend"
 	themeCmd "github.com/cloudposse/atmos/cmd/theme"
 	"github.com/cloudposse/atmos/cmd/version"
