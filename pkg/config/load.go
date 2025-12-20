@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -16,6 +17,7 @@ import (
 
 	errUtils "github.com/cloudposse/atmos/errors"
 	"github.com/cloudposse/atmos/pkg/auth/provisioning"
+	"github.com/cloudposse/atmos/pkg/config/casemap"
 	"github.com/cloudposse/atmos/pkg/filesystem"
 	log "github.com/cloudposse/atmos/pkg/logger"
 	"github.com/cloudposse/atmos/pkg/schema"
@@ -38,9 +40,32 @@ const (
 
 var defaultHomeDirProvider = filesystem.NewOSHomeDirProvider()
 
+// mergedConfigFiles tracks all config files merged during a LoadConfig call.
+// This is used to extract case-sensitive map keys from all sources, not just the main config.
+// The slice is reset at the start of each LoadConfig call.
+//
+// NOTE: This package-level state assumes sequential (non-concurrent) calls to LoadConfig.
+// LoadConfig is NOT safe for concurrent use. If concurrent config loading becomes necessary,
+// this should be refactored to pass state through a context or options struct.
+var mergedConfigFiles []string
+
+// resetMergedConfigFiles clears the tracked config files. Call at start of LoadConfig.
+func resetMergedConfigFiles() {
+	mergedConfigFiles = nil
+}
+
+// trackMergedConfigFile records a config file path for case-sensitive key extraction.
+func trackMergedConfigFile(path string) {
+	if path != "" {
+		mergedConfigFiles = append(mergedConfigFiles, path)
+	}
+}
+
 const (
 	profileKey       = "profile"
 	profileDelimiter = ","
+	// AtmosCliConfigPathEnvVar is the environment variable name for CLI config path.
+	AtmosCliConfigPathEnvVar = "ATMOS_CLI_CONFIG_PATH"
 )
 
 // parseProfilesFromOsArgs parses --profile flags from os.Args using pflag.
@@ -189,6 +214,9 @@ func getProfilesFromFlagsOrEnv() ([]string, string) {
 // NOTE: Global flags (like --profile) must be synced to Viper before calling this function.
 // This is done by syncGlobalFlagsToViper() in cmd/root.go PersistentPreRun.
 func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosConfiguration, error) {
+	// Reset merged config file tracker at start of each LoadConfig call.
+	resetMergedConfigFiles()
+
 	v := viper.New()
 	var atmosConfig schema.AtmosConfiguration
 	v.SetConfigType("yaml")
@@ -292,12 +320,21 @@ func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosCo
 		return atmosConfig, err
 	}
 
-	// Post-process to preserve case-sensitive identity names.
-	// Viper lowercases all map keys, but we need to preserve original case for identity names.
-	if err := preserveIdentityCase(v, &atmosConfig); err != nil {
-		log.Debug("Failed to preserve identity case", "error", err)
-		// Don't fail config loading if this step fails, just log it.
+	// Manually extract top-level env fields to avoid mapstructure tag collision.
+	// Both AtmosConfiguration.Env and Command.Env use "env" but with different types
+	// (map[string]string vs []CommandEnv), causing mapstructure to silently drop Commands.
+	// Using mapstructure:"-" on the Env fields and extracting manually here fixes this.
+	if envMap := v.GetStringMapString("env"); len(envMap) > 0 {
+		atmosConfig.Env = envMap
 	}
+	if envMap := v.GetStringMapString("templates.settings.env"); len(envMap) > 0 {
+		atmosConfig.Templates.Settings.Env = envMap
+	}
+
+	// Post-process to preserve case-sensitive map keys.
+	// Viper lowercases all YAML map keys, but we need to preserve original case
+	// for identity names and environment variables.
+	preserveCaseSensitiveMaps(v, &atmosConfig)
 
 	// Apply git root discovery for default base path.
 	// This enables running Atmos from any subdirectory, similar to Git.
@@ -390,25 +427,53 @@ func setDefaultConfiguration(v *viper.Viper) {
 	v.SetDefault("settings.pro.endpoint", AtmosProDefaultEndpoint)
 }
 
-// loadConfigSources delegates reading configs from each source,
-// returning early if any step in the chain fails.
+// loadConfigSources loads configuration from multiple sources in priority order,
+// delegating reading configs from each source and returning early if any step fails.
+//
+// Config loading order (lowest to highest priority, later wins):
+//  1. System dir (/usr/local/etc/atmos) - lowest priority
+//  2. Home dir (~/.atmos)
+//  3. Parent directory search (fallback for unusual structures)
+//  4. Git root (repo-root/atmos.yaml)
+//  5. CWD only (./atmos.yaml, NO parent search)
+//  6. Env var (ATMOS_CLI_CONFIG_PATH) - overrides discovery
+//  7. CLI arg (--config-path) - highest priority
+//
+// Note: Viper merges configs, so later sources override earlier ones.
 func loadConfigSources(v *viper.Viper, configAndStacksInfo *schema.ConfigAndStacksInfo) error {
+	// Load in order from lowest to highest priority (Viper merges, later wins).
+
+	// 1. System dir (lowest priority).
 	if err := readSystemConfig(v); err != nil {
 		return err
 	}
 
+	// 2. Home dir.
 	if err := readHomeConfig(v); err != nil {
 		return err
 	}
 
-	if err := readWorkDirConfig(v); err != nil {
+	// 3. Parent directory search (fallback).
+	if err := readParentDirConfig(v); err != nil {
 		return err
 	}
 
+	// 4. Git root.
+	if err := readGitRootConfig(v); err != nil {
+		return err
+	}
+
+	// 5. CWD only.
+	if err := readWorkDirConfigOnly(v); err != nil {
+		return err
+	}
+
+	// 6. Env var (ATMOS_CLI_CONFIG_PATH) - overrides discovery.
 	if err := readEnvAmosConfigPath(v); err != nil {
 		return err
 	}
 
+	// 7. CLI arg (highest priority).
 	return readAtmosConfigCli(v, configAndStacksInfo.AtmosCliConfigPath)
 }
 
@@ -463,13 +528,8 @@ func readHomeConfigWithProvider(v *viper.Viper, homeProvider filesystem.HomeDirP
 	return nil
 }
 
-// readWorkDirConfig loads config from current working directory or any parent directory.
-// It searches upward through the directory tree until it finds an atmos.yaml file
-// or reaches the filesystem root. This enables running atmos commands from any
-// subdirectory (e.g., component directories) without specifying --config-path.
-// Parent directory search can be disabled by setting ATMOS_CLI_CONFIG_PATH to "." or
-// any explicit path.
-func readWorkDirConfig(v *viper.Viper) error {
+// readWorkDirConfigOnly tries to load atmos.yaml from CWD only (no parent search).
+func readWorkDirConfigOnly(v *viper.Viper) error {
 	wd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -478,24 +538,76 @@ func readWorkDirConfig(v *viper.Viper) error {
 	// First try the current directory.
 	log.Trace("Checking for atmos.yaml in working directory", "path", wd)
 	err = mergeConfig(v, wd, CliConfigFileName, true)
-	if err == nil {
-		return nil
-	}
-
-	// If not a ConfigFileNotFoundError, return the error.
-	var configFileNotFoundError viper.ConfigFileNotFoundError
-	if !errors.As(err, &configFileNotFoundError) {
+	if err != nil {
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if errors.As(err, &configFileNotFoundError) {
+			return nil
+		}
 		return err
 	}
+	log.Trace("Found atmos.yaml in current directory", "path", wd)
+	return nil
+}
 
+// readGitRootConfig tries to load atmos.yaml from the git repository root.
+func readGitRootConfig(v *viper.Viper) error {
+	// Check if git root discovery is disabled.
+	//nolint:forbidigo // ATMOS_GIT_ROOT_BASEPATH is bootstrap config, not application configuration.
+	if os.Getenv("ATMOS_GIT_ROOT_BASEPATH") == "false" {
+		return nil
+	}
+
+	// If ATMOS_CLI_CONFIG_PATH is set, skip git root discovery.
+	// The env var is an explicit override.
+	//nolint:forbidigo // ATMOS_CLI_CONFIG_PATH controls config loading behavior itself.
+	if os.Getenv(AtmosCliConfigPathEnvVar) != "" {
+		return nil
+	}
+
+	gitRoot, err := u.ProcessTagGitRoot("!repo-root")
+	if err != nil {
+		log.Trace("Git root detection failed", "error", err)
+		return nil
+	}
+
+	// Skip if git root is empty or same as CWD (already handled by readWorkDirConfigOnly).
+	if gitRoot == "" || gitRoot == "." {
+		return nil
+	}
+
+	// Convert relative path to absolute.
+	if !filepath.IsAbs(gitRoot) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		gitRoot = filepath.Join(cwd, gitRoot)
+	}
+
+	err = mergeConfig(v, gitRoot, CliConfigFileName, true)
+	if err != nil {
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if errors.As(err, &configFileNotFoundError) {
+			return nil
+		}
+		return err
+	}
+	log.Trace("Found atmos.yaml at git root", "path", gitRoot)
+	return nil
+}
+
+// readParentDirConfig searches parent directories for atmos.yaml (fallback).
+func readParentDirConfig(v *viper.Viper) error {
 	// If ATMOS_CLI_CONFIG_PATH is set, don't search parent directories.
 	// This allows tests and users to explicitly control config discovery.
-	//nolint:forbidigo // ATMOS_CLI_CONFIG_PATH controls config loading behavior itself,
-	// it must be checked before viper loads config files. Using os.Getenv is necessary
-	// because this check happens during the config loading phase, before any viper
-	// bindings are established.
-	if os.Getenv("ATMOS_CLI_CONFIG_PATH") != "" {
+	//nolint:forbidigo // ATMOS_CLI_CONFIG_PATH controls config loading behavior itself.
+	if os.Getenv(AtmosCliConfigPathEnvVar) != "" {
 		return nil
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
 	}
 
 	// Search parent directories for atmos.yaml.
@@ -508,16 +620,27 @@ func readWorkDirConfig(v *viper.Viper) error {
 	// Found config in a parent directory, merge it.
 	err = mergeConfig(v, configDir, CliConfigFileName, true)
 	if err != nil {
-		switch err.(type) {
-		case viper.ConfigFileNotFoundError:
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if errors.As(err, &configFileNotFoundError) {
 			return nil
-		default:
-			return err
 		}
+		return err
 	}
 
-	log.Debug("Found atmos.yaml in parent directory", "path", configDir)
+	log.Trace("Found atmos.yaml in parent directory", "path", configDir)
 	return nil
+}
+
+// Deprecated: readWorkDirConfig is kept for backward compatibility.
+// Use readWorkDirConfigOnly, readGitRootConfig, and readParentDirConfig instead.
+func readWorkDirConfig(v *viper.Viper) error {
+	if err := readWorkDirConfigOnly(v); err != nil {
+		return err
+	}
+	if err := readGitRootConfig(v); err != nil {
+		return err
+	}
+	return readParentDirConfig(v)
 }
 
 // findAtmosConfigInParentDirs searches for atmos.yaml in parent directories.
@@ -550,7 +673,8 @@ func findAtmosConfigInParentDirs(startDir string) string {
 }
 
 func readEnvAmosConfigPath(v *viper.Viper) error {
-	atmosPath := os.Getenv("ATMOS_CLI_CONFIG_PATH")
+	//nolint:forbidigo // ATMOS_CLI_CONFIG_PATH controls config loading behavior itself.
+	atmosPath := os.Getenv(AtmosCliConfigPathEnvVar)
 	if atmosPath == "" {
 		return nil
 	}
@@ -559,13 +683,13 @@ func readEnvAmosConfigPath(v *viper.Viper) error {
 	if err != nil {
 		switch err.(type) {
 		case viper.ConfigFileNotFoundError:
-			log.Debug("config not found ENV var ATMOS_CLI_CONFIG_PATH", "file", atmosPath)
+			log.Debug("config not found ENV var "+AtmosCliConfigPathEnvVar, "file", atmosPath)
 			return nil
 		default:
 			return err
 		}
 	}
-	log.Debug("Found config ENV", "ATMOS_CLI_CONFIG_PATH", atmosPath)
+	log.Trace("Found config ENV", AtmosCliConfigPathEnvVar, atmosPath)
 
 	return nil
 }
@@ -994,6 +1118,9 @@ func mergeConfigFile(
 		return err
 	}
 
+	// Track this file for case-sensitive key extraction.
+	trackMergedConfigFile(path)
+
 	// Save existing commands before merge.
 	existingCommands := v.Get(commandsKey)
 
@@ -1098,58 +1225,89 @@ func loadEmbeddedConfig(v *viper.Viper) error {
 	return nil
 }
 
-// preserveIdentityCase extracts original case identity names from the raw YAML and creates a case mapping.
-// Viper lowercases all map keys, but we need to preserve original case for identity names.
-func preserveIdentityCase(v *viper.Viper, atmosConfig *schema.AtmosConfiguration) error {
-	// Get the auth.identities section from Viper before case conversion
-	// Viper's AllSettings() returns the lowercased version, so we need to parse the raw YAML
-	configFile := v.ConfigFileUsed()
-	if configFile == "" {
-		// No config file loaded, nothing to preserve
-		return nil
+// caseSensitivePaths lists the YAML paths that need case preservation.
+// Viper lowercases all map keys, but these sections need original case.
+var caseSensitivePaths = []string{
+	"env",             // Environment variables (e.g., GITHUB_TOKEN)
+	"auth.identities", // Auth identity names (e.g., SuperAdmin)
+}
+
+// collectConfigFilesForCasePreservation gathers all config files to process for case preservation.
+// It combines tracked merged files with the main config file (if not already tracked).
+func collectConfigFilesForCasePreservation(mainConfig string) []string {
+	filesToProcess := make([]string, 0, len(mergedConfigFiles)+1)
+	filesToProcess = append(filesToProcess, mergedConfigFiles...)
+
+	// Include the main config file if it wasn't already tracked.
+	if mainConfig != "" && !slices.Contains(filesToProcess, mainConfig) {
+		filesToProcess = append(filesToProcess, mainConfig)
 	}
 
-	// Read the raw YAML file
+	return filesToProcess
+}
+
+// mergeCaseMapsFromFile reads a config file and merges its case mappings into the accumulated result.
+// Later files override earlier ones (same precedence as config merging).
+func mergeCaseMapsFromFile(configFile string, mergedCaseMaps *casemap.CaseMaps) {
 	rawYAML, err := os.ReadFile(configFile)
 	if err != nil {
-		return fmt.Errorf("failed to read config file: %w", err)
+		log.Trace("Skipping case map extraction for unreadable file", "file", configFile, "error", err)
+		return
 	}
 
-	// Parse YAML to extract original case identity names
-	var rawConfig map[string]interface{}
-	if err := yaml.Unmarshal(rawYAML, &rawConfig); err != nil {
-		return fmt.Errorf("failed to parse YAML: %w", err)
+	fileCaseMaps, err := casemap.ExtractFromYAML(rawYAML, caseSensitivePaths)
+	if err != nil {
+		log.Trace("Failed to extract case mappings", "file", configFile, "error", err)
+		return
 	}
 
-	// Extract auth.identities with original case
-	authSection, ok := rawConfig["auth"].(map[string]interface{})
-	if !ok || authSection == nil {
-		// No auth section, nothing to preserve
-		return nil
+	for _, path := range caseSensitivePaths {
+		fileMap := fileCaseMaps.Get(path)
+		if fileMap == nil {
+			continue
+		}
+		existingMap := mergedCaseMaps.Get(path)
+		if existingMap == nil {
+			existingMap = make(casemap.CaseMap)
+		}
+		for k, v := range fileMap {
+			existingMap[k] = v
+		}
+		mergedCaseMaps.Set(path, existingMap)
 	}
+}
 
-	identitiesSection, ok := authSection["identities"].(map[string]interface{})
-	if !ok || identitiesSection == nil {
-		// No identities section, nothing to preserve
-		return nil
+// populateLegacyIdentityCaseMap copies auth.identities case mappings to the legacy IdentityCaseMap field.
+func populateLegacyIdentityCaseMap(caseMaps *casemap.CaseMaps, atmosConfig *schema.AtmosConfiguration) {
+	identityCaseMap := caseMaps.Get("auth.identities")
+	if identityCaseMap == nil {
+		return
 	}
-
-	// Create case mapping: lowercase -> original case
-	caseMap := make(map[string]string)
-	for originalName := range identitiesSection {
-		lowercaseName := strings.ToLower(originalName)
-		caseMap[lowercaseName] = originalName
-	}
-
-	// Store the case mapping in the config
 	if atmosConfig.Auth.IdentityCaseMap == nil {
 		atmosConfig.Auth.IdentityCaseMap = make(map[string]string)
 	}
-	for k, v := range caseMap {
+	for k, v := range identityCaseMap {
 		atmosConfig.Auth.IdentityCaseMap[k] = v
 	}
+}
 
-	log.Debug("Preserved identity case mapping", "identities", len(caseMap))
+// preserveCaseSensitiveMaps extracts original case for registered paths from raw YAML files.
+// This creates a mapping that can be used to restore original case when accessing these maps.
+// It processes all merged config files (main config + imports) with later files taking precedence.
+// This function operates on a best-effort basis - errors are logged but don't fail config loading.
+func preserveCaseSensitiveMaps(v *viper.Viper, atmosConfig *schema.AtmosConfiguration) {
+	filesToProcess := collectConfigFilesForCasePreservation(v.ConfigFileUsed())
+	if len(filesToProcess) == 0 {
+		return
+	}
 
-	return nil
+	mergedCaseMaps := casemap.New()
+	for _, configFile := range filesToProcess {
+		mergeCaseMapsFromFile(configFile, mergedCaseMaps)
+	}
+
+	atmosConfig.CaseMaps = mergedCaseMaps
+	populateLegacyIdentityCaseMap(mergedCaseMaps, atmosConfig)
+
+	log.Trace("Preserved case-sensitive map keys", "paths", caseSensitivePaths, "files_processed", len(filesToProcess))
 }
